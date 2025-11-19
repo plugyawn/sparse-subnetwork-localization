@@ -25,27 +25,27 @@ class ExpConfig:
     reward_model_name: str = "lvwerra/distilbert-imdb"
     max_prompt_tokens: int = 128
     max_new_tokens: int = 64
-    prompt_prefix_words: int = 8           # use only the first N words of each IMDB review
-    target_sentiment: str = "positive review"     # target sentiment for generation
+    prompt_prefix_words: int = 8           # use only the first N words of each IMDB review are fed as the prompt
+    target_sentiment: str = "Positive review"     # The beginning of the prompt is this btw, then we have teh IMDB part 
 
-    batch_size: int = 16              # PPO batch per update
-    mini_batch_size: int = 4
+    batch_size: int = 32              # PPO batch per update
+    mini_batch_size: int = 8         #  32 / 8 = 4 
     ppo_epochs: int = 4
-    learning_rate: float = 2e-6       # reduced for stability
-    target_kl: float = 0.01
+    learning_rate: float = 5e-6       # reduced for stability
+    target_kl: float = 3
     cliprange: float = 0.2            # PPO clipping range
-    num_updates: int = 200                            # PPO updates
+    num_updates: int = 600                            # PPO updates
 
     rank_log_every: int = 20                          # log rank stats every N steps
-    tau: float = 1e-4                                  # tolerance for "updated" weights
+    tau: float = 1e-6                                  # tolerance for "updated" weights
 
-    save_ckpt_every: int = 10                         # save model every N steps
+    save_ckpt_every: int = 20                         # save model every N steps
     ckpt_dir: str = "checkpoints"
 
     device: str = "cuda"
 
-    dtype: torch.dtype = torch.float32 
-    use_wandb: bool = False             # toggle W&B logging
+    dtype: torch.dtype = torch.bfloat16 
+    use_wandb: bool = True             # toggle W&B logging
 
 
 cfg = ExpConfig()
@@ -89,7 +89,7 @@ def reward_model() -> tuple[AutoTokenizer, nn.Module]:
     rm_tok = AutoTokenizer.from_pretrained(cfg.reward_model_name)
     rm = AutoModelForSequenceClassification.from_pretrained(
         cfg.reward_model_name, 
-        torch_dtype=cfg.dtype, 
+        torch_dtype=torch.float32, 
         use_safetensors=True
     ).to(cfg.device)
     rm.eval()
@@ -120,7 +120,7 @@ def main():
 
     if cfg.use_wandb:
         os.environ.pop("WANDB_DISABLED", None)
-        wandb.init(project="ppo-gpt2small-sentiment", config=vars(cfg))
+        wandb.init(project="final-ppo-gpt2-medium", config=vars(cfg))
     else:
         os.environ["WANDB_DISABLED"] = "true"
 
@@ -179,7 +179,6 @@ def main():
         batch_texts = sample_batch(cfg.batch_size)
         batch_prefixes = [" ".join(t.split()[:cfg.prompt_prefix_words]) for t in batch_texts]
         
-        # Add sentiment instruction to prompts for generation
         # Format: "Sentiment: positive\nReview: <truncated_review>"
         batch_prompts_with_sentiment = [
             f"Sentiment: {cfg.target_sentiment}. {prefix}" 
@@ -187,32 +186,30 @@ def main():
         ]
 
         enc = tok(
-            batch_prompts_with_sentiment,  # use prompts with sentiment instruction
+            batch_prompts_with_sentiment,  
             return_tensors="pt",
             padding=True,
             truncation=True,
             max_length=cfg.max_prompt_tokens,
         ).to(trainer.accelerator.device)
 
-        input_ids = enc["input_ids"]  # [B, Lmax]
-        attn = enc["attention_mask"]  # [B, Lmax]
-        lengths = attn.sum(dim=1).tolist()  # true prompt length per sample
+        input_ids = enc["input_ids"]  
+        attn = enc["attention_mask"]  
+        lengths = attn.sum(dim=1).tolist()  
 
-        # Build list of trimmed query tensors for TRL (right padding: prompt is at the start)
         query_tensors = [input_ids[i, :lengths[i]].clone() for i in range(len(lengths))]
 
-        # ---- generate with current policy ----
         print(f"[step {step}] sampling responses...") if step % 5 == 0 else None
         gen_tensors = trainer.generate(
             query_tensors,
             max_new_tokens=cfg.max_new_tokens,
-            min_new_tokens=24,  # enforce minimum tokens to ensure substantial completions
+            min_new_tokens=12,  
             do_sample=True,
             top_k=50,
             top_p=0.95,
             temperature=1,
             pad_token_id=tok.eos_token_id,
-        )  # list of [L+L_new] tensors
+        )  
         print(f"[step {step}] generated {len(gen_tensors) if isinstance(gen_tensors, list) else gen_tensors.size(0)} sequences.") if step % 5 == 0 else None
 
         # Extract response portion from each generated sequence
@@ -226,12 +223,10 @@ def main():
                 response_list.append(response)
                 valid_indices.append(idx)
 
-        # Check if we have any valid responses
         if len(response_list) == 0:
             print(f"[step {step}] all responses were empty; skipping step.")
             continue
         
-        # Log average response length
         avg_len = float(torch.tensor([r.numel() for r in response_list]).float().mean())
         print(f"[step {step}] avg_response_len={avg_len:.1f}") if step % 5 == 0 else None
         
@@ -253,50 +248,40 @@ def main():
             padded_resps.append(r)
             padded_masks.append(mask)
 
-        # Pad responses for reward computation (using same padding as PPO)
-        response_tensors = torch.stack(padded_resps)  # [B, max_len]
+        response_tensors = torch.stack(padded_resps)  
 
-        # Decode generated responses
         generated_texts = tok.batch_decode(response_tensors, skip_special_tokens=True)
         
-        # For reward computation: use truncated IMDB review + generated text (not sentiment instruction)
-        # This ensures the classifier sees the actual review context + continuation
-        full_texts_for_reward = [
-            batch_prefixes_filtered[i] + " " + generated_texts[i]
-            for i in range(len(generated_texts))
-        ]
-
-        # ---- compute rewards ----
-        rewards_vec = compute_rewards(rm_tok, rm, full_texts_for_reward)  # [B] - truncated review + generated text
         
-        # Keep rewards directional: don't center (zero the mean) so positive rewards push policy correctly
-        # Only scale down to prevent overly aggressive updates while maintaining direction
-        reward_scale = 0.02  # scale factor to keep advantages reasonable
-        rewards_scaled = rewards_vec * reward_scale
+        # Score only the generated text for a cleaner signal on the model's output quality
+        rewards_vec = compute_rewards(rm_tok, rm, generated_texts)  # [B] - only for generated text
         
-        reward_tensors = [r.unsqueeze(0) for r in rewards_scaled]  # list[Tensor[1]]
+        # Whitening: center and scale rewards to prevent reward bias and control advantage magnitude
+        rewards_mean = rewards_vec.mean()
+        rewards_std = rewards_vec.std(unbiased=False) + 1e-6  
+        rewards_normalized = (rewards_vec - rewards_mean) / rewards_std
         
-        # Debugging: print reward stats including max
+        reward_scale = 1.0 # i was gonna rmeove this but whatevs
+        rewards_scaled = rewards_normalized * reward_scale
+        
+        reward_tensors = [r.unsqueeze(0) for r in rewards_scaled]  
+        
         raw_max = rewards_vec.max().item()
         print(f"[step {step}] computed rewards, raw_mean={rewards_vec.mean().item():.4f}, raw_std={rewards_vec.std().item():.4f}, raw_max={raw_max:.4f}, scaled_mean={rewards_scaled.mean().item():.4f}, scaled_std={rewards_scaled.std().item():.4f}")
         
-        # Debugging: print sample outputs and their rewards (every step, or every N steps)
-        if step % 5 == 0 or step <= 3:  # print more frequently in early steps
+        if step % 5 == 0 or step <= 3:  
             sample_idx = 0
-            if len(full_texts_for_reward) > sample_idx:
+            if len(generated_texts) > sample_idx:
                 # Show IMDB prompt and GPT-generated text separately for clarity
                 imdb_prompt = batch_prefixes_filtered[sample_idx]
                 gpt_generated = generated_texts[sample_idx]
-                full_text = full_texts_for_reward[sample_idx]
                 
                 print(f"[step {step}] === Sample Output ===")
                 print(f"[step {step}] IMDB PROMPT (first {cfg.prompt_prefix_words} words): {imdb_prompt}")
-                print(f"[step {step}] GPT GENERATED TEXT: {gpt_generated[:400]}{'...' if len(gpt_generated) > 400 else ''}")
+                print(f"[step {step}] GPT GENERATED TEXT (scored for reward): {gpt_generated[:400]}{'...' if len(gpt_generated) > 400 else ''}")
                 print(f"[step {step}] Reward: raw={rewards_vec[sample_idx].item():.4f}, scaled={rewards_scaled[sample_idx].item():.4f}")
                 print(f"[step {step}] ====================")
 
-        # ---- PPO update ----
-        # Use filtered query_tensors with padded responses and masks
         stats = trainer.step(query_tensors_filtered, padded_resps, reward_tensors, padded_masks)
         
         # Debugging: print KL and ratio stats
@@ -323,9 +308,19 @@ def main():
         
         kl_val = safe_get_float("objective/kl")
         kl_dist_val = safe_get_float("objective/kl_dist")
-        print(f"[step {step}] ppo step done. KL={kl_val:.4f}, KL_dist={kl_dist_val:.4f}, stats keys: {list(stats.keys())[:5]} ...") if step % 5 == 0 else None
+        print(f"[step {step}] ppo step done. KL={kl_val:.4f}, KL_dist={kl_dist_val:.4f}, stats keys: {list(stats.keys())[:5]} ...")
         
-        # Debugging: print response length histogram (min/max)
+        # Log key metrics to wandb every step for detailed monitoring
+        if cfg.use_wandb and wandb.run is not None:
+            wandb.log(
+                {
+                    "reward/raw_mean": rewards_vec.mean().item(),
+                    "objective/kl": kl_val,
+                    "ppo/policy/entropy": safe_get_float("ppo/policy/entropy"),
+                },
+                step=step,
+            )
+        
         response_lens = [r.numel() for r in response_list]
         if response_lens:
             min_len, max_len = min(response_lens), max(response_lens)
@@ -349,12 +344,16 @@ def main():
             # log a few representative layers (avoid spamming W&B)
             if cfg.use_wandb and wandb.run is not None:
                 for name, s in list(layer_stats.items())[:10]:
+                    # Log all rank types together for each layer to plot them on the same graph
                     wandb.log(
                         {
-                            f"rank/eff/{name}": s["eff_rank"],
-                            f"rank/stable/{name}": s["stable_rank"],
+                            f"Ranks/{name}": {
+                                "classical": s.get("classical_rank", float('nan')), 
+                                "effective": s["eff_rank"],
+                                "stable": s["stable_rank"],
+                            },
+                            # Log other metrics separately as before
                             f"norm/fro/{name}": s["fro_norm"],
-                            f"sparsity/frac_large/{name}": s["frac_large"],
                             f"sparsity/percent_updated/{name}": s["percent_updated"],
                         },
                         step=step,

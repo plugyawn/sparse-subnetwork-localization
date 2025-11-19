@@ -63,6 +63,7 @@ def get_layer_rank_stats(model: nn.Module,
         W = param.detach().cpu()
 
         dW = W - W_0
+        classical_rank = torch.linalg.matrix_rank(dW.to(torch.float32)).item()
         eff_rank = get_effective_rank(dW) 
         stable_rank = get_stable_rank(dW)
         fro_norm = float(torch.linalg.norm(dW.to(torch.float32)))
@@ -75,26 +76,81 @@ def get_layer_rank_stats(model: nn.Module,
         frac_large = torch.mean((abs_flat_dW > thresh).float()).item()
         percent_updated = torch.mean((abs_flat_dW > tolerance).float()).item()
 
-        stats[name] = {"shape": dW.shape, "eff_rank": eff_rank, "stable_rank": stable_rank, 
+        stats[name] = {"shape": dW.shape, "classical_rank": classical_rank, "eff_rank": eff_rank, "stable_rank": stable_rank, 
         "fro_norm": fro_norm, "frac_large": frac_large, "percent_updated": percent_updated}
 
 
     return stats
 
 
-def experiment_1():
-    samples = 50000
-    matrix_list = [torch.randn(20, 20) for _ in range(samples)]
+def experiment_1(n=1024):
+    """
+    Runs an experiment to compare rank measures for random n x n matrices.
+    :param n: The dimension of the square matrices to generate.
+    """
+    # Automatically select GPU if available, otherwise fallback to CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- Running experiment for {n}x{n} matrices on {device.type} ---")
+    
+    samples = 100
+    
+    # Move matrix creation and computation to the selected device
+    matrix_list = [torch.randn(n, n, device=device) for _ in range(samples)]
+    
     effective_rank_list = [get_effective_rank(matrix) for matrix in matrix_list]
     classic_rank_list = [get_rank(matrix) for matrix in matrix_list]
     stable_rank_list = [get_stable_rank(matrix) for matrix in matrix_list]
-    nuclear_rank_list = [nuclear_rank(matrix) for matrix in matrix_list]
-    plt.hist(effective_rank_list, bins=20, label="Effective Rank", alpha=0.7)
-    plt.hist(stable_rank_list, bins=20, label="Stable Rank", alpha=0.7)
-    plt.hist(classic_rank_list, bins=20, label="Classic Rank", alpha=0.7)
-    plt.hist(nuclear_rank_list, bins=20, label="Nuclear Rank", alpha=0.7)
+
+    # Calculate and print the mean of each rank type
+    mean_effective = sum(effective_rank_list) / len(effective_rank_list)
+    mean_stable = sum(stable_rank_list) / len(stable_rank_list)
+    mean_classic = sum(classic_rank_list) / len(classic_rank_list)
+
+    # --- Calculate and print the standard deviation ---
+    # Convert lists to tensors, ensuring they have a float dtype for .std()
+    effective_tensor = torch.tensor(effective_rank_list, dtype=torch.float32)
+    stable_tensor = torch.tensor(stable_rank_list, dtype=torch.float32)
+    classic_tensor = torch.tensor(classic_rank_list, dtype=torch.float32)
+
+    std_effective = effective_tensor.std().item()
+    std_stable = stable_tensor.std().item()
+    std_classic = classic_tensor.std().item()
+
+    print(f"\nMean Effective Rank: {mean_effective:.2f} (Std Dev: {std_effective:.4f})")
+    print(f"Mean Stable Rank   : {mean_stable:.2f} (Std Dev: {std_stable:.4f})")
+    print(f"Mean Classic Rank  : {mean_classic:.2f} (Std Dev: {std_classic:.4f})\n")
+    
+    # Plot Histograms (as you have it now)
+    plt.hist(effective_rank_list, bins=10, label="Effective Rank", alpha=0.7)
+    plt.hist(stable_rank_list, bins=10, label="Stable Rank", alpha=0.7)
+    
+    # --- Manually create a thick bar for the classical rank ---
+    bar_start = n - 1
+    bar_end = n
+    bar_width = bar_end - bar_start
+    bar_center = bar_start + (bar_width / 2)
+    
+    # The height is the number of samples, which is 100
+    count_of_classical_rank = len(classic_rank_list) 
+    
+    plt.bar(bar_center, count_of_classical_rank, width=bar_width, 
+            color='green', alpha=0.7, label=f"Classic Rank = {classic_rank_list[0]}")
+    
+    # --- Add the means as custom ticks on the X-axis ---
+    # Get the current ticks
+    current_ticks = plt.xticks()[0]
+    
+    # Combine current ticks with the calculated means, then sort
+    new_ticks = sorted(list(set(current_ticks.tolist() + [mean_effective, mean_stable, mean_classic])))
+    
+    # Set the new ticks on the x-axis
+    plt.xticks(ticks=new_ticks, rotation=45) # Rotate for better readability if they overlap
+    
+    plt.ylim(top=max(plt.ylim()[1], count_of_classical_rank * 1.05))
+
+    # We can remove the axvline calls and just have a clean legend
     plt.legend()
-    plt.title("Effective Rank vs Stable Rank vs Classic Rank vs Nuclear Rank")
+    plt.title(f"Rank Distributions for {n}x{n} Full-Rank Random Matrices")
     plt.xlabel("Rank")
     plt.ylabel("Frequency")
     plt.show()      
