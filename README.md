@@ -89,20 +89,26 @@ Utility module containing helper functions for rank analysis:
 
 - **`get_rank()`**: Computes classical matrix rank (number of linearly independent columns/rows)
 
-- **`get_effective_rank()`**: Computes effective rank using entropy of singular values. For a matrix $A$ with singular values $\sigma_1 \geq \sigma_2 \geq \ldots \geq \sigma_n$, the effective rank is defined as:
+- **`get_effective_rank()`**: Computes effective rank using entropy of singular values. For a matrix A with singular values σ₁ ≥ σ₂ ≥ ... ≥ σₙ, the effective rank is defined as:
   
-  $$p_i = \frac{\sigma_i}{\sum_{j=1}^n \sigma_j}, \quad \text{entropy}(p) = -\sum_{i=1}^n p_i \log(p_i), \quad \text{effective\_rank}(A) = \exp(\text{entropy}(p))$$
+  ```
+  p_i = σ_i / (Σⱼ σ_j)
+  entropy(p) = -Σᵢ p_i log(p_i)
+  effective_rank(A) = exp(entropy(p))
+  ```
   
   The effective rank measures how "spread out" the singular values are. A matrix with uniform singular values has effective rank equal to the number of singular values, while a matrix with one dominant singular value has effective rank close to 1.
 
-- **`get_stable_rank()`**: Computes stable rank (also known as numerical rank). For a matrix $A$ with singular values $\sigma_1 \geq \sigma_2 \geq \ldots \geq \sigma_n$:
+- **`get_stable_rank()`**: Computes stable rank (also known as numerical rank). For a matrix A with singular values σ₁ ≥ σ₂ ≥ ... ≥ σₙ:
   
-  $$\text{stable\_rank}(A) = \frac{\|A\|_F^2}{\|A\|_2^2} = \frac{\sum_{i=1}^n \sigma_i^2}{\sigma_1^2}$$
+  ```
+  stable_rank(A) = ||A||_F² / ||A||_2² = (Σᵢ σ_i²) / σ₁²
+  ```
   
-  where $\|A\|_F$ is the Frobenius norm and $\|A\|_2 = \sigma_1$ is the spectral norm (largest singular value). The stable rank is always between 1 and the classical rank, and provides a more robust measure of rank in the presence of numerical errors.
+  where `||A||_F` is the Frobenius norm and `||A||_2 = σ₁` is the spectral norm (largest singular value). The stable rank is always between 1 and the classical rank, and provides a more robust measure of rank in the presence of numerical errors.
 
 - **`get_layer_rank_stats()`**: Computes comprehensive statistics for model layers including:
-  - Classical, effective, and stable ranks of weight deltas ($\Delta W = W_t - W_0$)
+  - Classical, effective, and stable ranks of weight deltas (ΔW = W_t - W₀)
   - Frobenius norm of weight changes
   - Percentage of weights updated above threshold
   - Fraction of large weight updates
