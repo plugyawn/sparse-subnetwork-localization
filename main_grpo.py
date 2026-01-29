@@ -52,6 +52,8 @@ class GRPOConfig:
     log_matformer: bool = True
     matformer_tau: float = 1e-6
     matformer_log_every: int = 1
+    freeze_vision: bool = False
+    reward_device: Optional[str] = None
 
     # Runtime
     seed: int = 0
@@ -103,12 +105,14 @@ def load_policy_and_ref(cfg: GRPOConfig) -> Tuple[AutoTokenizer, torch.nn.Module
     }
     policy = AutoModelForCausalLM.from_pretrained(cfg.policy_name, **model_kwargs).to(cfg.device)
     maybe_patch_config(policy.config)
+    policy.config.use_cache = False
     policy.train()
 
     ref_name = cfg.ref_name or cfg.policy_name
     ref_device = cfg.ref_device or cfg.device
     ref = AutoModelForCausalLM.from_pretrained(ref_name, **model_kwargs).to(ref_device)
     maybe_patch_config(ref.config)
+    ref.config.use_cache = False
     ref.requires_grad_(False)
     ref.eval()
 
@@ -118,6 +122,8 @@ def load_policy_and_ref(cfg: GRPOConfig) -> Tuple[AutoTokenizer, torch.nn.Module
 def build_matformer_base_state(policy: torch.nn.Module) -> dict[str, torch.Tensor]:
     base_state: dict[str, torch.Tensor] = {}
     for name, param in policy.named_parameters():
+        if not param.requires_grad:
+            continue
         if not name.endswith("weight"):
             continue
         lower = name.lower()
@@ -151,11 +157,12 @@ def load_reward_model(cfg: GRPOConfig) -> Tuple[Optional[AutoTokenizer], Optiona
     if not cfg.reward_model_name:
         return None, None
     rm_tok = AutoTokenizer.from_pretrained(cfg.reward_model_name)
+    rm_device = cfg.reward_device or cfg.device
     rm = AutoModelForSequenceClassification.from_pretrained(
         cfg.reward_model_name,
         torch_dtype=torch.float32,
         use_safetensors=True,
-    ).to(cfg.device)
+    ).to(rm_device)
     rm.eval()
     return rm_tok, rm
 
@@ -279,8 +286,11 @@ def main() -> None:
     parser.add_argument("--policy", dest="policy_name", type=str, default=GRPOConfig.policy_name)
     parser.add_argument("--ref", dest="ref_name", type=str, default=None)
     parser.add_argument("--reward_model", type=str, default=None)
+    parser.add_argument("--reward_device", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="imdb")
     parser.add_argument("--max_samples", type=int, default=GRPOConfig.max_samples)
+    parser.add_argument("--max_prompt_tokens", type=int, default=GRPOConfig.max_prompt_tokens)
+    parser.add_argument("--max_new_tokens", type=int, default=GRPOConfig.max_new_tokens)
     parser.add_argument("--batch_size", type=int, default=GRPOConfig.batch_size)
     parser.add_argument("--group_size", type=int, default=GRPOConfig.group_size)
     parser.add_argument("--max_steps", type=int, default=GRPOConfig.max_steps)
@@ -291,6 +301,7 @@ def main() -> None:
     parser.add_argument("--foreach", action="store_true", help="Enable torch foreach optimizer kernels.")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--ref_device", type=str, default=None)
+    parser.add_argument("--freeze_vision", action="store_true")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
         "--dtype",
@@ -312,8 +323,11 @@ def main() -> None:
         policy_name=args.policy_name,
         ref_name=args.ref_name,
         reward_model_name=args.reward_model,
+        reward_device=args.reward_device,
         dataset=args.dataset,
         max_samples=args.max_samples,
+        max_prompt_tokens=args.max_prompt_tokens,
+        max_new_tokens=args.max_new_tokens,
         batch_size=args.batch_size,
         group_size=args.group_size,
         max_steps=args.max_steps,
@@ -324,6 +338,7 @@ def main() -> None:
         foreach=args.foreach,
         gradient_checkpointing=args.gradient_checkpointing,
         ref_device=args.ref_device,
+        freeze_vision=args.freeze_vision,
         device=args.device,
         dtype=dtype_map[args.dtype],
     )
@@ -334,13 +349,14 @@ def main() -> None:
         cfg.save_every = 5
         cfg.batch_size = max(cfg.batch_size, 1)
         cfg.group_size = max(cfg.group_size, 2)
-        cfg.max_prompt_tokens = 128
-        cfg.max_new_tokens = 64
+        cfg.max_prompt_tokens = min(cfg.max_prompt_tokens, 96)
+        cfg.max_new_tokens = min(cfg.max_new_tokens, 32)
         cfg.matformer_log_every = 5
         if "gemma-3" in cfg.policy_name.lower():
             cfg.optimizer = "adafactor"
             cfg.foreach = False
             cfg.gradient_checkpointing = True
+            cfg.freeze_vision = True
 
     if args.smoke:
         cfg.policy_name = "tiny-random/gemma-3n"
@@ -359,6 +375,7 @@ def main() -> None:
         cfg.save_every = 0
         cfg.optimizer = "adamw"
         cfg.foreach = False
+        cfg.freeze_vision = False
 
     set_seed(cfg.seed)
 
@@ -368,6 +385,13 @@ def main() -> None:
     prompts = load_prompts(cfg)
     if cfg.gradient_checkpointing:
         policy.gradient_checkpointing_enable()
+        if hasattr(policy, "enable_input_require_grads"):
+            policy.enable_input_require_grads()
+
+    if cfg.freeze_vision:
+        for name, param in policy.named_parameters():
+            if "vision" in name:
+                param.requires_grad = False
 
     if cfg.optimizer == "adafactor":
         from transformers.optimization import Adafactor
@@ -433,7 +457,7 @@ def main() -> None:
         decoded = tok.batch_decode(gen[:, enc["input_ids"].shape[1] :], skip_special_tokens=True)
 
         if rm is not None:
-            rewards = compute_rewards_from_rm(rm_tok, rm, decoded, cfg.device)
+            rewards = compute_rewards_from_rm(rm_tok, rm, decoded, cfg.reward_device or cfg.device)
         else:
             rewards = compute_rewards_heuristic(decoded).to(cfg.device)
 

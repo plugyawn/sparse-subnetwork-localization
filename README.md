@@ -82,6 +82,21 @@ python main_grpo.py \
   --short
 ```
 
+If you're still OOM, try offloading the ref/reward model and shortening sequences:
+
+```bash
+python main_grpo.py \
+  --policy google/gemma-3n-E4B-it \
+  --reward_model lvwerra/distilbert-imdb \
+  --reward_device cpu \
+  --ref_device cpu \
+  --max_prompt_tokens 96 \
+  --max_new_tokens 32 \
+  --device cuda \
+  --dtype bfloat16 \
+  --short
+```
+
 ### 1. Train with PPO (generates checkpoints)
 
 ```bash
