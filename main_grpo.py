@@ -225,6 +225,12 @@ def compute_logprobs(
     prompt_lens: torch.Tensor,
     pad_token_id: int,
 ) -> torch.Tensor:
+    model_device = next(model.parameters()).device
+    input_ids = input_ids.to(model_device)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(model_device)
+    prompt_lens = prompt_lens.to(model_device)
+
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     logits = outputs.logits[:, :-1, :]
     labels = input_ids[:, 1:]
