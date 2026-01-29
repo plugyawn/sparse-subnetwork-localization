@@ -4,15 +4,16 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer, Auto
 from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datasets import load_dataset
 import wandb
 from utils import *
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 import numpy
 import scipy
 import trl
 import transformers
+from configs import get_model_config, get_name_filter_for_model, MODEL_CONFIGS
 
 print("numpy", numpy.__version__)
 print("scipy", scipy.__version__)
@@ -21,31 +22,62 @@ print("transformers", transformers.__version__)
 
 @dataclass
 class ExpConfig:
-    policy_name: str = "gpt2-medium"   # base LM
+    # Model configuration
+    policy_name: str = "gpt2-medium"   # base LM - can be "gpt2-medium", "google/gemma-3n-E2B-it", etc.
     reward_model_name: str = "lvwerra/distilbert-imdb"
+
+    # Generation settings
     max_prompt_tokens: int = 128
     max_new_tokens: int = 64
     prompt_prefix_words: int = 8           # use only the first N words of each IMDB review are fed as the prompt
-    target_sentiment: str = "Positive review"     # The beginning of the prompt is this btw, then we have teh IMDB part 
+    target_sentiment: str = "Positive review"     # The beginning of the prompt is this btw, then we have teh IMDB part
 
+    # PPO hyperparameters
     batch_size: int = 32              # PPO batch per update
-    mini_batch_size: int = 8         #  32 / 8 = 4 
+    mini_batch_size: int = 8         #  32 / 8 = 4
     ppo_epochs: int = 4
     learning_rate: float = 5e-6       # reduced for stability
     target_kl: float = 3
     cliprange: float = 0.2            # PPO clipping range
     num_updates: int = 600                            # PPO updates
 
+    # Logging and checkpointing
     rank_log_every: int = 20                          # log rank stats every N steps
     tau: float = 1e-6                                  # tolerance for "updated" weights
-
     save_ckpt_every: int = 20                         # save model every N steps
     ckpt_dir: str = "checkpoints"
 
+    # Hardware settings
     device: str = "cuda"
-
-    dtype: torch.dtype = torch.bfloat16 
+    dtype: torch.dtype = torch.bfloat16
     use_wandb: bool = True             # toggle W&B logging
+
+    # Localization analysis settings
+    log_localization: bool = True      # log localization metrics (gini, entropy, etc.)
+    topk_layers: int = 3               # for top-k concentration metric
+
+    # Model-specific settings (auto-detected from policy_name)
+    _name_filter: Optional[Tuple[str, ...]] = field(default=None, repr=False)
+    _is_gemma: bool = field(default=False, repr=False)
+
+    def __post_init__(self):
+        """Auto-detect model-specific settings."""
+        model_config = get_model_config(self.policy_name)
+        self._name_filter = model_config.name_filter
+        self._is_gemma = "gemma" in self.policy_name.lower()
+
+        # Adjust settings for Gemma-3n (larger model needs smaller batch)
+        if self._is_gemma:
+            print(f"[config] Detected Gemma model: {self.policy_name}")
+            print(f"[config] Using name filter: {self._name_filter}")
+            # Reduce batch size for larger models if not explicitly set
+            # (user can override by setting batch_size before __post_init__)
+
+
+def get_experiment_name(cfg: ExpConfig) -> str:
+    """Generate experiment name for wandb based on config."""
+    model_short = cfg.policy_name.split("/")[-1]
+    return f"ppo-{model_short}-sentiment"
 
 
 cfg = ExpConfig()
@@ -59,29 +91,62 @@ def load_imdb_dataset(max_samples: int = 10000) -> List[str]:
     return texts
 
 def build_policy_and_ref_model() -> tuple[AutoTokenizer, nn.Module, nn.Module]:
+    """
+    Build policy and reference models with appropriate loading for model type.
+
+    Handles both GPT-2 style models and Gemma-3n with proper tokenizer/processor setup.
+    """
     dtype = cfg.dtype
-    tok = AutoTokenizer.from_pretrained(cfg.policy_name, padding_side="right")
+    model_config = get_model_config(cfg.policy_name)
+
+    # Load tokenizer (Gemma-3n uses processor but we extract tokenizer for text-only tasks)
+    if model_config.use_processor:
+        try:
+            from transformers import AutoProcessor
+            processor = AutoProcessor.from_pretrained(cfg.policy_name, trust_remote_code=True)
+            tok = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+        except Exception as e:
+            print(f"[warning] Could not load processor, falling back to tokenizer: {e}")
+            tok = AutoTokenizer.from_pretrained(cfg.policy_name, trust_remote_code=True, padding_side="right")
+    else:
+        tok = AutoTokenizer.from_pretrained(cfg.policy_name, padding_side="right")
+
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
+    # Common model loading kwargs
+    model_kwargs = {
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+        "use_safetensors": True,
+    }
+
+    # Add trust_remote_code for Gemma models
+    if cfg._is_gemma:
+        model_kwargs["trust_remote_code"] = True
+        print(f"[model] Loading Gemma-3n model with trust_remote_code=True")
+
+    # Load policy model
     policy = AutoModelForCausalLMWithValueHead.from_pretrained(
         cfg.policy_name,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
+        **model_kwargs,
     ).to(cfg.device)
     policy.config.use_cache = False
     policy.gradient_checkpointing_disable()
 
+    # Load reference model
     ref = AutoModelForCausalLMWithValueHead.from_pretrained(
         cfg.policy_name,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
+        **model_kwargs,
     ).to(cfg.device)
     ref.config.use_cache = False
     ref.requires_grad_(False)
     ref.eval()
+
+    # Print model info
+    total_params = sum(p.numel() for p in policy.parameters())
+    trainable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    print(f"[model] {cfg.policy_name}: {total_params:,} total params, {trainable_params:,} trainable")
 
     return tok, policy, ref
 
@@ -120,7 +185,8 @@ def main():
 
     if cfg.use_wandb:
         os.environ.pop("WANDB_DISABLED", None)
-        wandb.init(project="final-ppo-gpt2-medium", config=vars(cfg))
+        experiment_name = get_experiment_name(cfg)
+        wandb.init(project="sparse-subnetwork-localization", name=experiment_name, config=vars(cfg))
     else:
         os.environ["WANDB_DISABLED"] = "true"
 
@@ -336,10 +402,19 @@ def main():
                 rewards=rewards_vec,
             )
 
-        # ---- rank + sparsity logging ----
+        # ---- rank + sparsity + localization logging ----
         if step % cfg.rank_log_every == 0:
-            # get_layer_rank_stats should accept (model, init_state, tau=...)
-            layer_stats = get_layer_rank_stats(trainer.model, init_state, tolerance=cfg.tau)
+            # get_layer_rank_stats with model-specific name filter
+            layer_stats = get_layer_rank_stats(
+                trainer.model,
+                init_state,
+                name_filter=cfg._name_filter,
+                tolerance=cfg.tau
+            )
+
+            # Compute localization metrics
+            localization = compute_localization_summary(layer_stats, k=cfg.topk_layers)
+            block_stats = compute_per_block_stats(layer_stats)
 
             # log a few representative layers (avoid spamming W&B)
             if cfg.use_wandb and wandb.run is not None:
@@ -348,7 +423,7 @@ def main():
                     wandb.log(
                         {
                             f"Ranks/{name}": {
-                                "classical": s.get("classical_rank", float('nan')), 
+                                "classical": s.get("classical_rank", float('nan')),
                                 "effective": s["eff_rank"],
                                 "stable": s["stable_rank"],
                             },
@@ -359,6 +434,28 @@ def main():
                         step=step,
                     )
 
+                # Log localization metrics
+                if cfg.log_localization:
+                    wandb.log(
+                        {
+                            "localization/gini": localization["gini"],
+                            "localization/entropy": localization["entropy"],
+                            "localization/topk_concentration": localization["topk_concentration"],
+                            "localization/num_active_layers": localization["num_active_layers"],
+                        },
+                        step=step,
+                    )
+
+                    # Log per-block Frobenius norms for heatmap visualization
+                    for block_idx, stats in block_stats.items():
+                        if block_idx >= 0:  # Skip non-layer params
+                            wandb.log(
+                                {
+                                    f"block_updates/block_{block_idx:02d}": stats["total_fro_norm"],
+                                },
+                                step=step,
+                            )
+
             # diagnostic print
             some_name = sorted(layer_stats.keys())[0]
             print(
@@ -368,6 +465,12 @@ def main():
                 f"fro={layer_stats[some_name]['fro_norm']:.2e}, "
                 f"percent_updated={layer_stats[some_name]['percent_updated']:.3f}, "
                 f"frac_large={layer_stats[some_name]['frac_large']:.3f}"
+            )
+            print(
+                f"[step {step}] LOCALIZATION: "
+                f"gini={localization['gini']:.3f}, "
+                f"entropy={localization['entropy']:.3f}, "
+                f"top{cfg.topk_layers}_conc={localization['topk_concentration']:.3f}"
             )
 
         # ---- save checkpoints for sparse-subnetwork analysis ----
