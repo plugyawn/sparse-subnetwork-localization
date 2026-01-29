@@ -97,6 +97,12 @@ python main_grpo.py \
   --short
 ```
 
+Disable the progress bar if you want clean logs:
+
+```bash
+python main_grpo.py --no_tqdm ...
+```
+
 ### 1. Train with PPO (generates checkpoints)
 
 ```bash

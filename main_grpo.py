@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -15,6 +16,7 @@ from transformers import (
 )
 
 from configs import get_model_config, analyze_matformer_nesting
+from tqdm import tqdm
 
 
 @dataclass
@@ -54,6 +56,8 @@ class GRPOConfig:
     matformer_log_every: int = 1
     freeze_vision: bool = False
     reward_device: Optional[str] = None
+    tqdm: bool = True
+    tqdm_update_every: int = 1
 
     # Runtime
     seed: int = 0
@@ -308,6 +312,9 @@ def main() -> None:
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--ref_device", type=str, default=None)
     parser.add_argument("--freeze_vision", action="store_true")
+    parser.add_argument("--tqdm", dest="tqdm", action="store_true", help="Enable tqdm progress bar.")
+    parser.add_argument("--no_tqdm", dest="tqdm", action="store_false", help="Disable tqdm progress bar.")
+    parser.add_argument("--tqdm_update_every", type=int, default=GRPOConfig.tqdm_update_every)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
         "--dtype",
@@ -330,6 +337,8 @@ def main() -> None:
         ref_name=args.ref_name,
         reward_model_name=args.reward_model,
         reward_device=args.reward_device,
+        tqdm=args.tqdm,
+        tqdm_update_every=args.tqdm_update_every,
         dataset=args.dataset,
         max_samples=args.max_samples,
         max_prompt_tokens=args.max_prompt_tokens,
@@ -382,6 +391,7 @@ def main() -> None:
         cfg.optimizer = "adamw"
         cfg.foreach = False
         cfg.freeze_vision = False
+        cfg.tqdm = False
 
     set_seed(cfg.seed)
 
@@ -435,7 +445,18 @@ def main() -> None:
         os.makedirs(cfg.save_dir, exist_ok=True)
         torch.save(policy.state_dict(), os.path.join(cfg.save_dir, "step_000.pt"))
 
-    for step in range(1, cfg.max_steps + 1):
+    step_iter = range(1, cfg.max_steps + 1)
+    if cfg.tqdm:
+        step_iter = tqdm(step_iter, desc="grpo", dynamic_ncols=True)
+
+    def log(msg: str) -> None:
+        if cfg.tqdm and hasattr(step_iter, "write"):
+            step_iter.write(msg)
+        else:
+            print(msg)
+
+    for step in step_iter:
+        step_start = time.time()
         batch_prompts = random.sample(prompts, cfg.batch_size)
         batch_prompts = build_prompts(cfg, batch_prompts)
 
@@ -483,12 +504,22 @@ def main() -> None:
         loss.backward()
         optimizer.step()
 
-        print(
-            f"[step {step}] loss={loss.item():.4f} "
-            f"reward_mean={rewards.mean().item():.3f} "
-            f"reward_std={rewards.std(unbiased=False).item():.3f} "
-            f"kl_mean={kl.mean().item():.4f}"
-        )
+        step_time = time.time() - step_start
+        if cfg.tqdm:
+            if step % max(1, cfg.tqdm_update_every) == 0:
+                step_iter.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    reward=f"{rewards.mean().item():.3f}",
+                    kl=f"{kl.mean().item():.4f}",
+                    sec=f"{step_time:.2f}",
+                )
+        else:
+            log(
+                f"[step {step}] loss={loss.item():.4f} "
+                f"reward_mean={rewards.mean().item():.3f} "
+                f"reward_std={rewards.std(unbiased=False).item():.3f} "
+                f"kl_mean={kl.mean().item():.4f}"
+            )
 
         if (
             cfg.log_matformer
@@ -504,19 +535,19 @@ def main() -> None:
             )
             total = sum(level_counts.values()) + 1e-8
             level_fracs = {k: v / total for k, v in sorted(level_counts.items())}
-            print(f"[step {step}] MatFormer shells counts={level_counts} fracs={level_fracs}")
+            log(f"[step {step}] MatFormer shells counts={level_counts} fracs={level_fracs}")
 
         if cfg.eval_every and step % cfg.eval_every == 0:
             eval_reward = run_eval(policy, tok, eval_prompts, cfg, rm_tok, rm)
-            print(f"[step {step}] eval_reward_mean={eval_reward:.3f}")
+            log(f"[step {step}] eval_reward_mean={eval_reward:.3f}")
 
         if cfg.save_every and cfg.save_every > 0 and step % cfg.save_every == 0:
             os.makedirs(cfg.save_dir, exist_ok=True)
             ckpt_path = os.path.join(cfg.save_dir, f"step_{step:03d}.pt")
             torch.save(policy.state_dict(), ckpt_path)
-            print(f"[step {step}] saved checkpoint {ckpt_path}")
+            log(f"[step {step}] saved checkpoint {ckpt_path}")
 
-    print("GRPO smoke run complete.")
+    log("GRPO smoke run complete.")
 
 
 if __name__ == "__main__":
