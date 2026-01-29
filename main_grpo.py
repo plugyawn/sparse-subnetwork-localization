@@ -471,6 +471,10 @@ def main() -> None:
         with torch.no_grad():
             logp_ref = compute_logprobs(ref, gen, gen_attention, prompt_lens, tok.pad_token_id)
 
+        # Move rewards/logp_ref to policy device for math
+        rewards = rewards.to(logp.device)
+        logp_ref = logp_ref.to(logp.device)
+
         adv = group_normalize(rewards, group_ids.to(rewards.device))
         kl = (logp - logp_ref)
         loss = (-(adv.detach() * logp) + cfg.kl_coef * kl).mean()
