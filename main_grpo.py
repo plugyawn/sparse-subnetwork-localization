@@ -284,7 +284,7 @@ def run_eval(
     )
     decoded = tok.batch_decode(gen[:, enc["input_ids"].shape[1] :], skip_special_tokens=True)
     if rm is not None:
-        rewards = compute_rewards_from_rm(rm_tok, rm, decoded, cfg.device)
+        rewards = compute_rewards_from_rm(rm_tok, rm, decoded, cfg.reward_device or cfg.device)
     else:
         rewards = compute_rewards_heuristic(decoded)
     model.train()
