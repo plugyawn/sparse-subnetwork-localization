@@ -68,6 +68,20 @@ python main_grpo.py \
   --short
 ```
 
+If you OOM with full Adam, try Adafactor:
+
+```bash
+python main_grpo.py \
+  --policy google/gemma-3n-E4B-it \
+  --reward_model lvwerra/distilbert-imdb \
+  --dataset imdb \
+  --device cuda \
+  --dtype bfloat16 \
+  --optimizer adafactor \
+  --gradient_checkpointing \
+  --short
+```
+
 ### 1. Train with PPO (generates checkpoints)
 
 ```bash

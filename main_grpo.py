@@ -44,6 +44,10 @@ class GRPOConfig:
     eval_every: int = 1
     save_dir: str = "checkpoints_grpo"
     save_every: int = 5
+    optimizer: str = "adamw"  # adamw | adafactor | adamw8bit
+    foreach: bool = False
+    gradient_checkpointing: bool = False
+    ref_device: Optional[str] = None
     # MatFormer shell logging (Gemma-3n)
     log_matformer: bool = True
     matformer_tau: float = 1e-6
@@ -102,7 +106,8 @@ def load_policy_and_ref(cfg: GRPOConfig) -> Tuple[AutoTokenizer, torch.nn.Module
     policy.train()
 
     ref_name = cfg.ref_name or cfg.policy_name
-    ref = AutoModelForCausalLM.from_pretrained(ref_name, **model_kwargs).to(cfg.device)
+    ref_device = cfg.ref_device or cfg.device
+    ref = AutoModelForCausalLM.from_pretrained(ref_name, **model_kwargs).to(ref_device)
     maybe_patch_config(ref.config)
     ref.requires_grad_(False)
     ref.eval()
@@ -282,6 +287,10 @@ def main() -> None:
     parser.add_argument("--eval_every", type=int, default=GRPOConfig.eval_every)
     parser.add_argument("--save_dir", type=str, default=GRPOConfig.save_dir)
     parser.add_argument("--save_every", type=int, default=GRPOConfig.save_every)
+    parser.add_argument("--optimizer", type=str, default=GRPOConfig.optimizer, choices=["adamw", "adafactor", "adamw8bit"])
+    parser.add_argument("--foreach", action="store_true", help="Enable torch foreach optimizer kernels.")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--ref_device", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
         "--dtype",
@@ -311,6 +320,10 @@ def main() -> None:
         eval_every=args.eval_every,
         save_dir=args.save_dir,
         save_every=args.save_every,
+        optimizer=args.optimizer,
+        foreach=args.foreach,
+        gradient_checkpointing=args.gradient_checkpointing,
+        ref_device=args.ref_device,
         device=args.device,
         dtype=dtype_map[args.dtype],
     )
@@ -324,6 +337,10 @@ def main() -> None:
         cfg.max_prompt_tokens = 128
         cfg.max_new_tokens = 64
         cfg.matformer_log_every = 5
+        if "gemma-3n" in cfg.policy_name.lower():
+            cfg.optimizer = "adafactor"
+            cfg.foreach = False
+            cfg.gradient_checkpointing = True
 
     if args.smoke:
         cfg.policy_name = "tiny-random/gemma-3n"
@@ -340,6 +357,8 @@ def main() -> None:
         cfg.dtype = torch.float32
         cfg.log_matformer = True
         cfg.save_every = 0
+        cfg.optimizer = "adamw"
+        cfg.foreach = False
 
     set_seed(cfg.seed)
 
@@ -347,7 +366,26 @@ def main() -> None:
     rm_tok, rm = load_reward_model(cfg)
 
     prompts = load_prompts(cfg)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.learning_rate)
+    if cfg.gradient_checkpointing:
+        policy.gradient_checkpointing_enable()
+
+    if cfg.optimizer == "adafactor":
+        from transformers.optimization import Adafactor
+        optimizer = Adafactor(
+            policy.parameters(),
+            lr=cfg.learning_rate,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+        )
+    elif cfg.optimizer == "adamw8bit":
+        try:
+            import bitsandbytes as bnb
+        except Exception as exc:
+            raise RuntimeError("bitsandbytes is required for adamw8bit") from exc
+        optimizer = bnb.optim.AdamW8bit(policy.parameters(), lr=cfg.learning_rate)
+    else:
+        optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.learning_rate, foreach=cfg.foreach)
 
     eval_prompts = build_prompts(cfg, prompts[: min(4, len(prompts))])
 
