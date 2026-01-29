@@ -1,7 +1,6 @@
 import os
 import random
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM
-from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
@@ -14,6 +13,13 @@ import scipy
 import trl
 import transformers
 from configs import get_model_config, get_name_filter_for_model, MODEL_CONFIGS
+
+# Apply TRL patch for Gemma 3/3n compatibility BEFORE importing TRL models
+# This fixes: UnboundLocalError: hidden_size referenced before assignment
+from configs.trl_gemma_patch import patch_trl_for_gemma
+patch_trl_for_gemma()
+
+from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 
 print("numpy", numpy.__version__)
 print("scipy", scipy.__version__)
