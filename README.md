@@ -34,6 +34,40 @@ pip install -r requirements.txt
 
 ## Usage
 
+### 0. GRPO (CPU-friendly smoke test)
+
+Minimal GRPO runner that works without TRL value heads and can run a 1-step CPU smoke test:
+
+```bash
+# CPU smoke test (tiny Gemma random weights)
+python main_grpo.py --smoke
+```
+
+For real runs, pass a Gemma-3/Gemma-3n model and a reward model:
+
+```bash
+python main_grpo.py \
+  --policy google/gemma-3-4b-it \
+  --reward_model lvwerra/distilbert-imdb \
+  --dataset imdb \
+  --batch_size 2 \
+  --group_size 2 \
+  --max_steps 5 \
+  --eval_every 1
+```
+
+Short-run preset (good for quick GPU sanity checks, with checkpointing):
+
+```bash
+python main_grpo.py \
+  --policy google/gemma-3n-E4B-it \
+  --reward_model lvwerra/distilbert-imdb \
+  --dataset imdb \
+  --device cuda \
+  --dtype bfloat16 \
+  --short
+```
+
 ### 1. Train with PPO (generates checkpoints)
 
 ```bash

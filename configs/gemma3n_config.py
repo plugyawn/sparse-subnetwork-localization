@@ -20,9 +20,9 @@ GEMMA3N_MODELS = {
 }
 
 
-# Layer name filters for Gemma-3n architecture
+# Layer name filters for Gemma-3/Gemma-3n architecture
 # These are the parameter names that contain trainable weights we want to track
-GEMMA3N_NAME_FILTER = (
+GEMMA_NAME_FILTER = (
     "self_attn",
     "mlp",
     "q_proj",
@@ -72,16 +72,25 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     "gemma-3n-E2B": ModelConfig(
         name="gemma-3n-E2B",
         hf_id="google/gemma-3n-E2B-it",
-        name_filter=GEMMA3N_NAME_FILTER,
+        name_filter=GEMMA_NAME_FILTER,
         use_processor=True,
         is_matformer=True,
         num_layers=26,  # Approximate - verify from model config
         hidden_dim=2048,
     ),
+    "gemma-3-4b": ModelConfig(
+        name="gemma-3-4b",
+        hf_id="google/gemma-3-4b-it",
+        name_filter=GEMMA_NAME_FILTER,
+        use_processor=False,
+        is_matformer=False,
+        num_layers=0,  # Populate from model config at runtime if needed
+        hidden_dim=0,
+    ),
     "gemma-3n-E4B": ModelConfig(
         name="gemma-3n-E4B",
         hf_id="google/gemma-3n-E4B-it",
-        name_filter=GEMMA3N_NAME_FILTER,
+        name_filter=GEMMA_NAME_FILTER,
         use_processor=True,
         is_matformer=True,
         num_layers=30,  # Approximate - verify from model config
@@ -108,6 +117,28 @@ def get_model_config(model_name: str) -> ModelConfig:
     for config in MODEL_CONFIGS.values():
         if config.hf_id == model_name:
             return config
+
+    name_lower = model_name.lower()
+    if "gemma-3n" in name_lower:
+        return ModelConfig(
+            name=model_name,
+            hf_id=model_name,
+            name_filter=GEMMA_NAME_FILTER,
+            use_processor=True,
+            is_matformer=True,
+            num_layers=0,
+            hidden_dim=0,
+        )
+    if "gemma-3" in name_lower:
+        return ModelConfig(
+            name=model_name,
+            hf_id=model_name,
+            name_filter=GEMMA_NAME_FILTER,
+            use_processor=False,
+            is_matformer=False,
+            num_layers=0,
+            hidden_dim=0,
+        )
 
     # Default to GPT-2 style config for unknown models
     return ModelConfig(

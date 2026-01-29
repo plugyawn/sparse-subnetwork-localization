@@ -1,6 +1,6 @@
 from .gemma3n_config import (
     GEMMA3N_MODELS,
-    GEMMA3N_NAME_FILTER,
+    GEMMA_NAME_FILTER,
     GPT2_NAME_FILTER,
     MODEL_CONFIGS,
     ModelConfig,
@@ -18,7 +18,7 @@ from .trl_gemma_patch import (
 __all__ = [
     # Model configs
     "GEMMA3N_MODELS",
-    "GEMMA3N_NAME_FILTER",
+    "GEMMA_NAME_FILTER",
     "GPT2_NAME_FILTER",
     "MODEL_CONFIGS",
     "ModelConfig",
