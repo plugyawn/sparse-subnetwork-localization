@@ -56,7 +56,7 @@ python main_grpo.py \
   --eval_every 1
 ```
 
-Short-run preset (good for quick GPU sanity checks, with checkpointing):
+Short-run preset (good for quick GPU sanity checks, with checkpointing). On Gemma-3 / Gemma-3n this enables Adafactor + gradient checkpointing by default:
 
 ```bash
 python main_grpo.py \

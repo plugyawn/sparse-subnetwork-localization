@@ -337,7 +337,7 @@ def main() -> None:
         cfg.max_prompt_tokens = 128
         cfg.max_new_tokens = 64
         cfg.matformer_log_every = 5
-        if "gemma-3n" in cfg.policy_name.lower():
+        if "gemma-3" in cfg.policy_name.lower():
             cfg.optimizer = "adafactor"
             cfg.foreach = False
             cfg.gradient_checkpointing = True
