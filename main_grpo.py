@@ -592,7 +592,7 @@ def main() -> None:
             torch.save(policy.state_dict(), ckpt_path)
             log(f"[step {step}] saved checkpoint {ckpt_path}")
 
-    log("GRPO smoke run complete.")
+    log("GRPO run complete.")
 
 
 if __name__ == "__main__":
