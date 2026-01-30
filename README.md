@@ -60,12 +60,18 @@ Short-run preset (good for quick GPU sanity checks, with checkpointing). On Gemm
 
 ```bash
 python main_grpo.py \
-  --policy google/gemma-3n-E4B-it \
+  --policy google/gemma-3n-E2B-it \
   --reward_model lvwerra/distilbert-imdb \
   --dataset imdb \
   --device cuda \
   --dtype bfloat16 \
   --short
+```
+
+You can reduce update variance with larger groups or advantage clipping:
+
+```bash
+python main_grpo.py --policy google/gemma-3n-E2B-it --group_size 4 --adv_clip 5.0 --short
 ```
 
 If you OOM with full Adam, try Adafactor:
@@ -86,7 +92,7 @@ If you're still OOM, try offloading the ref/reward model and shortening sequence
 
 ```bash
 python main_grpo.py \
-  --policy google/gemma-3n-E4B-it \
+  --policy google/gemma-3n-E2B-it \
   --reward_model lvwerra/distilbert-imdb \
   --reward_device cpu \
   --ref_device cpu \
@@ -95,6 +101,12 @@ python main_grpo.py \
   --device cuda \
   --dtype bfloat16 \
   --short
+```
+
+Easy GRPO sanity check (dummy prompts + heuristic reward, no reward model):
+
+```bash
+python main_grpo.py --easy --policy google/gemma-3n-E2B-it --device cuda --dtype bfloat16
 ```
 
 Disable the progress bar if you want clean logs:

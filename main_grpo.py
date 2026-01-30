@@ -22,7 +22,7 @@ from tqdm import tqdm
 @dataclass
 class GRPOConfig:
     # Model / data
-    policy_name: str = "google/gemma-3-4b-it"
+    policy_name: str = "google/gemma-3n-E2B-it"
     ref_name: Optional[str] = None
     reward_model_name: Optional[str] = None
     dataset: str = "imdb"  # or "dummy"
@@ -42,6 +42,7 @@ class GRPOConfig:
     group_size: int = 2
     learning_rate: float = 1e-5
     kl_coef: float = 0.1
+    adv_clip: Optional[float] = 5.0
     max_steps: int = 1
     eval_every: int = 1
     save_dir: str = "checkpoints_grpo"
@@ -56,6 +57,7 @@ class GRPOConfig:
     matformer_log_every: int = 1
     freeze_vision: bool = False
     reward_device: Optional[str] = None
+    reward_on_full_prompt: bool = True
     tqdm: bool = True
     tqdm_update_every: int = 1
 
@@ -114,7 +116,10 @@ def load_policy_and_ref(cfg: GRPOConfig) -> Tuple[AutoTokenizer, torch.nn.Module
 
     ref_name = cfg.ref_name or cfg.policy_name
     ref_device = cfg.ref_device or cfg.device
-    ref = AutoModelForCausalLM.from_pretrained(ref_name, **model_kwargs).to(ref_device)
+    ref_kwargs = dict(model_kwargs)
+    if ref_device == "cpu":
+        ref_kwargs["dtype"] = torch.float32
+    ref = AutoModelForCausalLM.from_pretrained(ref_name, **ref_kwargs).to(ref_device)
     maybe_patch_config(ref.config)
     ref.config.use_cache = False
     ref.requires_grad_(False)
@@ -164,7 +169,7 @@ def load_reward_model(cfg: GRPOConfig) -> Tuple[Optional[AutoTokenizer], Optiona
     rm_device = cfg.reward_device or cfg.device
     rm = AutoModelForSequenceClassification.from_pretrained(
         cfg.reward_model_name,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         use_safetensors=True,
     ).to(rm_device)
     rm.eval()
@@ -281,10 +286,15 @@ def run_eval(
         top_p=cfg.top_p,
         temperature=cfg.temperature,
         pad_token_id=tok.eos_token_id,
+        use_cache=False,
     )
     decoded = tok.batch_decode(gen[:, enc["input_ids"].shape[1] :], skip_special_tokens=True)
     if rm is not None:
-        rewards = compute_rewards_from_rm(rm_tok, rm, decoded, cfg.reward_device or cfg.device)
+        if cfg.reward_on_full_prompt:
+            reward_texts = [f"{p} {r}".strip() for p, r in zip(prompts, decoded)]
+        else:
+            reward_texts = decoded
+        rewards = compute_rewards_from_rm(rm_tok, rm, reward_texts, cfg.reward_device or cfg.device)
     else:
         rewards = compute_rewards_heuristic(decoded)
     model.train()
@@ -303,6 +313,9 @@ def main() -> None:
     parser.add_argument("--max_new_tokens", type=int, default=GRPOConfig.max_new_tokens)
     parser.add_argument("--batch_size", type=int, default=GRPOConfig.batch_size)
     parser.add_argument("--group_size", type=int, default=GRPOConfig.group_size)
+    parser.add_argument("--learning_rate", type=float, default=GRPOConfig.learning_rate)
+    parser.add_argument("--kl_coef", type=float, default=GRPOConfig.kl_coef)
+    parser.add_argument("--adv_clip", type=float, default=GRPOConfig.adv_clip)
     parser.add_argument("--max_steps", type=int, default=GRPOConfig.max_steps)
     parser.add_argument("--eval_every", type=int, default=GRPOConfig.eval_every)
     parser.add_argument("--save_dir", type=str, default=GRPOConfig.save_dir)
@@ -312,6 +325,8 @@ def main() -> None:
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--ref_device", type=str, default=None)
     parser.add_argument("--freeze_vision", action="store_true")
+    parser.add_argument("--reward_on_full_prompt", action="store_true")
+    parser.add_argument("--reward_on_response_only", dest="reward_on_full_prompt", action="store_false")
     parser.add_argument("--tqdm", dest="tqdm", action="store_true", help="Enable tqdm progress bar.")
     parser.add_argument("--no_tqdm", dest="tqdm", action="store_false", help="Disable tqdm progress bar.")
     parser.add_argument("--tqdm_update_every", type=int, default=GRPOConfig.tqdm_update_every)
@@ -323,7 +338,12 @@ def main() -> None:
         choices=["float32", "float16", "bfloat16"],
     )
     parser.add_argument("--short", action="store_true", help="Short-run config for quick GPU tests.")
+    parser.add_argument("--easy", action="store_true", help="Use dummy prompts + heuristic reward for quick sanity checks.")
     parser.add_argument("--smoke", action="store_true", help="Use tiny config for CPU smoke test.")
+    parser.set_defaults(
+        tqdm=GRPOConfig.tqdm,
+        reward_on_full_prompt=GRPOConfig.reward_on_full_prompt,
+    )
     args = parser.parse_args()
 
     dtype_map = {
@@ -345,6 +365,9 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         batch_size=args.batch_size,
         group_size=args.group_size,
+        learning_rate=args.learning_rate,
+        kl_coef=args.kl_coef,
+        adv_clip=args.adv_clip,
         max_steps=args.max_steps,
         eval_every=args.eval_every,
         save_dir=args.save_dir,
@@ -354,6 +377,7 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         ref_device=args.ref_device,
         freeze_vision=args.freeze_vision,
+        reward_on_full_prompt=args.reward_on_full_prompt,
         device=args.device,
         dtype=dtype_map[args.dtype],
     )
@@ -363,7 +387,7 @@ def main() -> None:
         cfg.eval_every = 5
         cfg.save_every = 5
         cfg.batch_size = max(cfg.batch_size, 1)
-        cfg.group_size = max(cfg.group_size, 2)
+        cfg.group_size = max(cfg.group_size, 4)
         cfg.max_prompt_tokens = min(cfg.max_prompt_tokens, 96)
         cfg.max_new_tokens = min(cfg.max_new_tokens, 32)
         cfg.matformer_log_every = 5
@@ -372,6 +396,20 @@ def main() -> None:
             cfg.foreach = False
             cfg.gradient_checkpointing = True
             cfg.freeze_vision = True
+        if cfg.adv_clip is None:
+            cfg.adv_clip = 5.0
+
+    if args.easy:
+        cfg.dataset = "dummy"
+        cfg.reward_model_name = None
+        cfg.reward_device = None
+        cfg.max_steps = min(cfg.max_steps, 5)
+        cfg.eval_every = 1
+        cfg.batch_size = max(cfg.batch_size, 1)
+        cfg.group_size = max(cfg.group_size, 4)
+        cfg.max_prompt_tokens = min(cfg.max_prompt_tokens, 64)
+        cfg.max_new_tokens = min(cfg.max_new_tokens, 32)
+        cfg.tqdm = False
 
     if args.smoke:
         cfg.policy_name = "tiny-random/gemma-3n"
@@ -478,13 +516,18 @@ def main() -> None:
             top_p=cfg.top_p,
             temperature=cfg.temperature,
             pad_token_id=tok.eos_token_id,
+            use_cache=False,
         )
 
         gen_attention = (gen != tok.pad_token_id).long()
         decoded = tok.batch_decode(gen[:, enc["input_ids"].shape[1] :], skip_special_tokens=True)
 
         if rm is not None:
-            rewards = compute_rewards_from_rm(rm_tok, rm, decoded, cfg.reward_device or cfg.device)
+            if cfg.reward_on_full_prompt:
+                reward_texts = [f"{p} {r}".strip() for p, r in zip(expanded, decoded)]
+            else:
+                reward_texts = decoded
+            rewards = compute_rewards_from_rm(rm_tok, rm, reward_texts, cfg.reward_device or cfg.device)
         else:
             rewards = compute_rewards_heuristic(decoded).to(cfg.device)
 
@@ -497,6 +540,8 @@ def main() -> None:
         logp_ref = logp_ref.to(logp.device)
 
         adv = group_normalize(rewards, group_ids.to(rewards.device))
+        if cfg.adv_clip is not None and cfg.adv_clip > 0:
+            adv = torch.clamp(adv, -cfg.adv_clip, cfg.adv_clip)
         kl = (logp - logp_ref)
         loss = (-(adv.detach() * logp) + cfg.kl_coef * kl).mean()
 
